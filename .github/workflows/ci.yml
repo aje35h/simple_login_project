@@ -1,90 +1,97 @@
+# .github/workflows/ci.yml
+
 name: Django CI & ECR Push 
 
 on:
   push: 
     branches:
-      - dev
+      - dev # This workflow now triggers on pushes to the 'dev' branch
+
 env:
   AWS_REGION: us-east-1 # Replace with your desired AWS region
-  ECR_REPOSITORY: <aws_account_id>.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com/your-django-app # Replace with your ECR repository name
+  # ECR_REPOSITORY now constructs the full URI using AWS account ID and region from GitHub Vars
+  ECR_REPOSITORY: <aws_account_id>.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com/your-django-app # Replace <aws_account_id> and 'your-django-app'
 
 jobs:
   prepare_migrations:
     runs-on: ubuntu-latest
     permissions:
-        contents: write
+        contents: write # Grant write permission for committing and pushing migrations
 
     steps:
-      - name: Checkout ${{ github.ref_name }} branch
+      - name: Checkout ${{ github.ref_name }} branch (source for code)
         uses: actions/checkout@v4
         with:
-          path: DJANGO_DEV_BRANCH
-          ref: ${{ github.ref_name }}
+          path: DJANGO_DEV_BRANCH # Checkout 'dev' branch into this directory
+          ref: ${{ github.ref_name }} # Refers to the 'dev' branch that triggered the workflow
 
-      - name: Checkout ${{ github.ref_name }}-release branch
+      - name: Checkout ${{ github.ref_name }}-release branch (target for migrations and build)
         uses: actions/checkout@v4
         with:
-          path: DJANGO_DEV_RELEASE_BRANCH
-          ref: ${{ github.ref_name }}-release 
+          path: DJANGO_DEV_RELEASE_BRANCH # Checkout 'dev-release' branch into this directory
+          ref: ${{ github.ref_name }}-release # Refers to the 'dev-release' branch
 
       - name: Sync code from ${{ github.ref_name }} to ${{ github.ref_name }}-release
+        # Use rsync to copy files, excluding .git, .gitignore, and existing migrations
         run: |
           rsync -av --delete --exclude='.git' --exclude='.gitignore' --exclude='migrations' DJANGO_DEV_BRANCH/ DJANGO_DEV_RELEASE_BRANCH/
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v4 # Using v4 for setup-python
         with:
-          python-version: "3.12"
+          python-version: "3.12" # Ensure this matches your Dockerfile's Python version
 
-      - name: Install dependencies
+      - name: Install dependencies for migration generation
         run: |
-          python -m pip install --upgrade pip
-          pip install -r DJANGO_DEV_RELEASE_BRANCH/requirements.txt
+          python -m pip install --upgrade pip # Upgrade pip to ensure latest version
+          pip install -r DJANGO_DEV_RELEASE_BRANCH/requirements.txt # Install dependencies for the release branch
 
-      - name: Run makemigrations
+      - name: Run makemigrations on the synced code
         run: |
-          cd DJANGO_DEV_RELEASE_BRANCH/
-          python manage.py makemigrations --noinput
+          cd DJANGO_DEV_RELEASE_BRANCH/ # Change to the release branch directory
+          python manage.py makemigrations --noinput # Generate new migrations non-interactively
 
       - name: Commit and push changes to ${{ github.ref_name }}-release
         run: |
+          cd DJANGO_DEV_RELEASE_BRANCH # Ensure we are in the correct directory
 
-          cd DJANGO_DEV_RELEASE_BRANCH
-
-          git config --global user.name "devops-bot"
+          git config --global user.name "devops-bot" # Configure Git user for the commit
           git config --global user.email "devopsbot@djangoapp.com"
           
-          git add .
+          git add . # Stage all changes (including new migrations)
+          # Check if there are any actual changes to commit before creating a commit
           git diff --quiet && git diff --staged --quiet || git commit -m "Sync code from ${{ github.ref_name }}-Commit ID:$(echo ${{ github.sha }} | cut -c1-7)"
-          git push origin ${{ github.ref_name }}-release
+          git push origin ${{ github.ref_name }}-release # Push changes to the dev-release branch
           
   build_and_push:
-    needs: prepare_migrations
+    needs: prepare_migrations # This job depends on 'prepare_migrations' completing successfully
     runs-on: ubuntu-latest
-    environment: ${{ github.ref_name }}
+    environment: dev # Associate this job with the 'dev' environment to access its secrets
     env:
-      DOCKER_REPO_NAME: ${{ vars.ECR_REPOSITORY }}
-      IMAGE_TAG: ${{ github.run_number }}
+      DOCKER_REPO_NAME: ${{ vars.ECR_REPOSITORY }} # Use GitHub Vars for the full ECR repository URI
+      IMAGE_TAG: ${{ github.run_number }} # Use GitHub run number as the image tag for unique versions
+
     steps:
-      - name: Checkout ${{ github.ref_name }}-release branch
+      - name: Checkout ${{ github.ref_name }}-release branch (for building the image)
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref_name }}-release
+          ref: ${{ github.ref_name }}-release # Checkout the dev-release branch, which now has the latest migrations
           
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v1
+        uses: aws-actions/configure-aws-credentials@v1 # Using v1 for configure-aws-credentials
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ vars.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }} # Retrieve from 'dev' environment secrets
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }} # Retrieve from 'dev' environment secrets
+          aws-region: ${{ vars.AWS_REGION }} # Use GitHub Vars for the AWS region
 
       - name: Login to Amazon ECR
         id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v1
+        uses: aws-actions/amazon-ecr-login@v1 # Using v1 for amazon-ecr-login
 
       - name: Build and push Docker image
         run: |
+          # Build the Docker image with two tags: a unique run number and 'latest'
           docker build -t $DOCKER_REPO_NAME:$IMAGE_TAG -t $DOCKER_REPO_NAME:latest .
+          # Push both tagged images to ECR
           docker push $DOCKER_REPO_NAME:$IMAGE_TAG
           docker push $DOCKER_REPO_NAME:latest
-  
