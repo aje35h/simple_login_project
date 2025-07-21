@@ -1,0 +1,90 @@
+name: Django CI & ECR Push 
+
+on:
+  push: 
+    branches:
+      - dev
+env:
+  AWS_REGION: us-east-1 # Replace with your desired AWS region
+  ECR_REPOSITORY: <aws_account_id>.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com/your-django-app # Replace with your ECR repository name
+
+jobs:
+  prepare_migrations:
+    runs-on: ubuntu-latest
+    permissions:
+        contents: write
+
+    steps:
+      - name: Checkout ${{ github.ref_name }} branch
+        uses: actions/checkout@v4
+        with:
+          path: DJANGO_DEV_BRANCH
+          ref: ${{ github.ref_name }}
+
+      - name: Checkout ${{ github.ref_name }}-release branch
+        uses: actions/checkout@v4
+        with:
+          path: DJANGO_DEV_RELEASE_BRANCH
+          ref: ${{ github.ref_name }}-release 
+
+      - name: Sync code from ${{ github.ref_name }} to ${{ github.ref_name }}-release
+        run: |
+          rsync -av --delete --exclude='.git' --exclude='.gitignore' --exclude='migrations' DJANGO_DEV_BRANCH/ DJANGO_DEV_RELEASE_BRANCH/
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r DJANGO_DEV_RELEASE_BRANCH/requirements.txt
+
+      - name: Run makemigrations
+        run: |
+          cd DJANGO_DEV_RELEASE_BRANCH/
+          python manage.py makemigrations --noinput
+
+      - name: Commit and push changes to ${{ github.ref_name }}-release
+        run: |
+
+          cd DJANGO_DEV_RELEASE_BRANCH
+
+          git config --global user.name "devops-bot"
+          git config --global user.email "devopsbot@djangoapp.com"
+          
+          git add .
+          git diff --quiet && git diff --staged --quiet || git commit -m "Sync code from ${{ github.ref_name }}-Commit ID:$(echo ${{ github.sha }} | cut -c1-7)"
+          git push origin ${{ github.ref_name }}-release
+          
+  build_and_push:
+    needs: prepare_migrations
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name }}
+    env:
+      DOCKER_REPO_NAME: ${{ vars.ECR_REPOSITORY }}
+      IMAGE_TAG: ${{ github.run_number }}
+    steps:
+      - name: Checkout ${{ github.ref_name }}-release branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}-release
+          
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build and push Docker image
+        run: |
+          docker build -t $DOCKER_REPO_NAME:$IMAGE_TAG -t $DOCKER_REPO_NAME:latest .
+          docker push $DOCKER_REPO_NAME:$IMAGE_TAG
+          docker push $DOCKER_REPO_NAME:latest
+  
